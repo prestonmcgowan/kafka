@@ -155,6 +155,8 @@ class ConsoleProducerTest {
       "--bootstrap-server", "localhost:9092",
       "--topic", "test",
       "--property", "key.separator=;",
+      "--property", "parse.partition=true",
+      "--property", "parse.timestamp=true",
       "--property", "parse.headers=true",
       "--reader-config", propsFile.getAbsolutePath
     )
@@ -163,6 +165,8 @@ class ConsoleProducerTest {
     reader.configure(ConsoleProducer.getReaderProps(config).asInstanceOf[java.util.Map[String, _]])
     assertEquals(";", reader.keySeparator)
     assertTrue(reader.parseKey)
+    assertTrue(reader.parsePartition)
+    assertTrue(reader.parseTimestamp)
     assertTrue(reader.parseHeaders)
   }
 

@@ -343,6 +343,8 @@ object ConsoleProducer extends Logging {
     var topic: String = _
     var parseKey = false
     var keySeparator = "\t"
+    var parsePartition = false
+    var parseTimestamp = false
     var parseHeaders = false
     var headersDelimiter = "\t"
     var headersSeparator = ","
@@ -357,6 +359,10 @@ object ConsoleProducer extends Logging {
       topic = props.get("topic").toString
       if (props.containsKey("parse.key"))
         parseKey = props.get("parse.key").toString.trim.equalsIgnoreCase("true")
+      if (props.containsPartition("parse.partition"))
+        parsePartition = props.get("parse.partition").toString.trim.equalsIgnoreCase("true")
+      if (props.containsTimestamp("parse.timestamp"))
+        parseTimestamp = props.get("parse.timestamp").toString.trim.equalsIgnoreCase("true")
       if (props.containsKey("key.separator"))
         keySeparator = props.get("key.separator").toString
       if (props.containsKey("parse.headers"))
@@ -403,14 +409,34 @@ object ConsoleProducer extends Logging {
               case line =>
                 val headers = parse(parseHeaders, line, 0, headersDelimiter, "headers delimiter")
                 val headerOffset = if (headers == null) 0 else headers.length + headersDelimiter.length
+                
+                val partition = parse(parsePartition, line, headerOffset, keySeparator, "key separator")
+                val partitionOffset = if (partition == null) 0 else partition.length + keySeparator.length
 
-                val key = parse(parseKey, line, headerOffset, keySeparator, "key separator")
+                var timestampS = parse(parseTimestamp, line, headerOffset, keySeparator, "key separator")
+                val timestampOffset = if (timestampS == null) 0 else timestampS.length + keySeparator.length
+                val now = Instant.now().toEpochMilli()
+                var timestamp = now
+                if (timestampS != null) {
+                  if (timestampS.startsWith("-")) {
+                    val subtract = timestampS.substring(1)
+                    timestamp = timestampS.toLong - subract.toLong
+                  } else if (timestampS.startsWith("+")) {
+                    val add = timestampS.substring(1)
+                    timestamp = timestampS.toLong - add.toLong
+                  }
+                }
+                
+
+                val key = parse(parseKey, line, timestampOffset, keySeparator, "key separator")
                 val keyOffset = if (key == null) 0 else key.length + keySeparator.length
 
                 val value = line.substring(headerOffset + keyOffset)
 
                 val record = new ProducerRecord[Array[Byte], Array[Byte]](
                   topic,
+                  if (partition != null && partition != nullMarker) partition.toInt else null,
+                  timestamp,
                   if (key != null && key != nullMarker) key.getBytes(StandardCharsets.UTF_8) else null,
                   if (value != null && value != nullMarker) value.getBytes(StandardCharsets.UTF_8) else null,
                 )
