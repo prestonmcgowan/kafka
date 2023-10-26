@@ -19,6 +19,7 @@ package kafka.tools
 
 import java.io._
 import java.nio.charset.StandardCharsets
+import java.time.Instant
 import java.util.Properties
 import java.util.regex.Pattern
 import joptsimple.{OptionException, OptionParser, OptionSet}
@@ -359,9 +360,9 @@ object ConsoleProducer extends Logging {
       topic = props.get("topic").toString
       if (props.containsKey("parse.key"))
         parseKey = props.get("parse.key").toString.trim.equalsIgnoreCase("true")
-      if (props.containsPartition("parse.partition"))
+      if (props.containsKey("parse.partition"))
         parsePartition = props.get("parse.partition").toString.trim.equalsIgnoreCase("true")
-      if (props.containsTimestamp("parse.timestamp"))
+      if (props.containsKey("parse.timestamp"))
         parseTimestamp = props.get("parse.timestamp").toString.trim.equalsIgnoreCase("true")
       if (props.containsKey("key.separator"))
         keySeparator = props.get("key.separator").toString
@@ -410,20 +411,25 @@ object ConsoleProducer extends Logging {
                 val headers = parse(parseHeaders, line, 0, headersDelimiter, "headers delimiter")
                 val headerOffset = if (headers == null) 0 else headers.length + headersDelimiter.length
                 
-                val partition = parse(parsePartition, line, headerOffset, keySeparator, "key separator")
-                val partitionOffset = if (partition == null) 0 else partition.length + keySeparator.length
+                val partitionS = parse(parsePartition, line, headerOffset, keySeparator, "key separator")
+                val partitionOffset = if (partitionS == null) 0 else partitionS.length + keySeparator.length
+                val partition = partitionS.toInt
+                  //if (partitionS == null) null else partitionS.toInt
+                
 
-                var timestampS = parse(parseTimestamp, line, headerOffset, keySeparator, "key separator")
+                val timestampS = parse(parseTimestamp, line, partitionOffset, keySeparator, "key separator")
                 val timestampOffset = if (timestampS == null) 0 else timestampS.length + keySeparator.length
                 val now = Instant.now().toEpochMilli()
                 var timestamp = now
                 if (timestampS != null) {
                   if (timestampS.startsWith("-")) {
                     val subtract = timestampS.substring(1)
-                    timestamp = timestampS.toLong - subract.toLong
+                    timestamp = timestampS.toLong - subtract.toLong
                   } else if (timestampS.startsWith("+")) {
                     val add = timestampS.substring(1)
-                    timestamp = timestampS.toLong - add.toLong
+                    timestamp = timestampS.toLong + add.toLong
+                  } else {
+                    timestamp = timestampS.toLong
                   }
                 }
                 
@@ -435,7 +441,7 @@ object ConsoleProducer extends Logging {
 
                 val record = new ProducerRecord[Array[Byte], Array[Byte]](
                   topic,
-                  if (partition != null && partition != nullMarker) partition.toInt else null,
+                  partition,
                   timestamp,
                   if (key != null && key != nullMarker) key.getBytes(StandardCharsets.UTF_8) else null,
                   if (value != null && value != nullMarker) value.getBytes(StandardCharsets.UTF_8) else null,
