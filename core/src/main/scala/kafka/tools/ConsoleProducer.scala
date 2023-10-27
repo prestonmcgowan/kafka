@@ -408,17 +408,16 @@ object ConsoleProducer extends Logging {
             current = line match {
               case null => null
               case line =>
-                val headers = parse(parseHeaders, line, 0, headersDelimiter, "headers delimiter")
-                val headerOffset = if (headers == null) 0 else headers.length + headersDelimiter.length
+                var parserOffset = 0
+                val headers = parse(parseHeaders, line, parserOffset, headersDelimiter, "headers delimiter")
+                if (headers != null) parserOffset +=headers.length + headersDelimiter.length
                 
-                val partitionS = parse(parsePartition, line, headerOffset, keySeparator, "key separator")
-                val partitionOffset = if (partitionS == null) 0 else partitionS.length + keySeparator.length
-                val partition = partitionS.toInt
-                  //if (partitionS == null) null else partitionS.toInt
+                val partitionS = parse(parsePartition, line, parserOffset, keySeparator, "key separator")
+                if (partitionS != null) parserOffset += partitionS.length + keySeparator.length
                 
 
-                val timestampS = parse(parseTimestamp, line, partitionOffset, keySeparator, "key separator")
-                val timestampOffset = if (timestampS == null) 0 else timestampS.length + keySeparator.length
+                val timestampS = parse(parseTimestamp, line, parserOffset, keySeparator, "key separator")
+                if (timestampS != null) parserOffset += timestampS.length + keySeparator.length
                 val now = Instant.now().toEpochMilli()
                 var timestamp = now
                 if (timestampS != null) {
@@ -434,18 +433,29 @@ object ConsoleProducer extends Logging {
                 }
                 
 
-                val key = parse(parseKey, line, timestampOffset, keySeparator, "key separator")
-                val keyOffset = if (key == null) 0 else key.length + keySeparator.length
+                val key = parse(parseKey, line, parserOffset, keySeparator, "key separator")
+                if (key != null) parserOffset += key.length + keySeparator.length
 
-                val value = line.substring(headerOffset + keyOffset)
+                val value = line.substring(parserOffset)
 
-                val record = new ProducerRecord[Array[Byte], Array[Byte]](
-                  topic,
-                  partition,
-                  timestamp,
-                  if (key != null && key != nullMarker) key.getBytes(StandardCharsets.UTF_8) else null,
-                  if (value != null && value != nullMarker) value.getBytes(StandardCharsets.UTF_8) else null,
-                )
+                val record = 
+                  if (partitionS == null) {
+                    new ProducerRecord[Array[Byte], Array[Byte]](
+                      topic,
+                      null,
+                      timestamp,
+                      if (key != null && key != nullMarker) key.getBytes(StandardCharsets.UTF_8) else null,
+                      if (value != null && value != nullMarker) value.getBytes(StandardCharsets.UTF_8) else null,
+                    )
+                  } else {
+                    new ProducerRecord[Array[Byte], Array[Byte]](
+                      topic,
+                      partitionS.toInt,
+                      timestamp,
+                      if (key != null && key != nullMarker) key.getBytes(StandardCharsets.UTF_8) else null,
+                      if (value != null && value != nullMarker) value.getBytes(StandardCharsets.UTF_8) else null,
+                    )
+                  }
 
                 if (headers != null && headers != nullMarker) {
                   splitHeaders(headers)
