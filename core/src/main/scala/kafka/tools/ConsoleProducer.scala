@@ -423,15 +423,14 @@ object ConsoleProducer extends Logging {
                 if (timestampS != null) {
                   if (timestampS.startsWith("-")) {
                     val subtract = timestampS.substring(1)
-                    timestamp = timestampS.toLong - subtract.toLong
+                    timestamp = now - subtract.toLong
                   } else if (timestampS.startsWith("+")) {
                     val add = timestampS.substring(1)
-                    timestamp = timestampS.toLong + add.toLong
+                    timestamp = now + add.toLong
                   } else {
                     timestamp = timestampS.toLong
                   }
                 }
-                
 
                 val key = parse(parseKey, line, parserOffset, keySeparator, "key separator")
                 if (key != null) parserOffset += key.length + keySeparator.length
