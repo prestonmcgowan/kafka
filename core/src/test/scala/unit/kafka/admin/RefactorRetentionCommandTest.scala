@@ -21,7 +21,7 @@ import java.time.Duration
 import java.util.concurrent.{ExecutorService, Executors, TimeUnit}
 import java.util.{Collections, Properties}
 
-import kafka.admin.ConsumerGroupCommand.{ConsumerGroupCommandOptions, ConsumerGroupService}
+import kafka.admin.RefactorRetentionCommand.{RefactorRetentionCommandOptions, ConsumerGroupService}
 import kafka.integration.KafkaServerTestHarness
 import kafka.server.KafkaConfig
 import kafka.utils.TestUtils
@@ -35,8 +35,8 @@ import org.junit.jupiter.api.{AfterEach, BeforeEach, TestInfo}
 import scala.jdk.CollectionConverters._
 import scala.collection.mutable.ArrayBuffer
 
-class ConsumerGroupCommandTest extends KafkaServerTestHarness {
-  import ConsumerGroupCommandTest._
+class RefactorRetentionCommandTest extends KafkaServerTestHarness {
+  import RefactorRetentionCommandTest._
 
   val topic = "foo"
   val group = "test.group"
@@ -84,7 +84,7 @@ class ConsumerGroupCommandTest extends KafkaServerTestHarness {
   }
 
   def getConsumerGroupService(args: Array[String]): ConsumerGroupService = {
-    val opts = new ConsumerGroupCommandOptions(args)
+    val opts = new RefactorRetentionCommandOptions(args)
     val service = new ConsumerGroupService(opts, Map(AdminClientConfig.RETRIES_CONFIG -> Int.MaxValue.toString))
     consumerGroupService = service :: consumerGroupService
     service
@@ -115,7 +115,7 @@ class ConsumerGroupCommandTest extends KafkaServerTestHarness {
 
 }
 
-object ConsumerGroupCommandTest {
+object RefactorRetentionCommandTest {
 
   abstract class AbstractConsumerRunnable(broker: String, groupId: String, customPropsOpt: Option[Properties] = None,
                                           syncCommit: Boolean = false) extends Runnable {

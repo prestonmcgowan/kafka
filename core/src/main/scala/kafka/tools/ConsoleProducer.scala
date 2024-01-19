@@ -438,7 +438,7 @@ object ConsoleProducer extends Logging {
                 val value = line.substring(parserOffset)
 
                 val record = 
-                  if (partitionS == null) {
+                  if (partitionS == null || partitionS == nullMarker) {
                     new ProducerRecord[Array[Byte], Array[Byte]](
                       topic,
                       null,

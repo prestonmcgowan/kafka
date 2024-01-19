@@ -18,23 +18,13 @@ import org.apache.kafka.server.util.{CommandDefaultOptions, CommandLineUtils}
 
 import scala.jdk.CollectionConverters._
 import scala.collection.{Map, Seq, immutable, mutable}
-import scala.collection.mutable.{HashMap, ListBuffer}
+import scala.collection.mutable.{HashMap, HashSet, ListBuffer}
 import scala.util.{Failure, Success, Try}
 import joptsimple.{OptionException, OptionSpec}
 import org.apache.kafka.common.protocol.Errors
 
 import scala.collection.immutable.TreeMap
 import org.apache.kafka.common.ConsumerGroupState
-
-// Unused imports for now
-// import java.time.{Duration, Instant}
-// 
-// import com.fasterxml.jackson.dataformat.csv.CsvMapper
-// import com.fasterxml.jackson.module.scala.DefaultScalaModule
-// import org.apache.kafka.common.{KafkaException, Node, TopicPartition}
-// 
-// import scala.reflect.ClassTag
-// import org.apache.kafka.common.requests.ListOffsetsResponse
 
 object RefactorRetentionCommand extends Logging {
 
@@ -43,9 +33,9 @@ object RefactorRetentionCommand extends Logging {
   val DEFAULT_RETENTION_MIN = 3600000L
   val DEFAULT_RETENTION_MAX = 604800000L
   val DEFAULT_RETENTION_STEP = 3600000L
-  
 
-  case class TopicPartitionOffset(topic: String, partition: Int, offset: Long) extends Product with Serializable
+
+  case class TopicPartitionOffset(topic: String, partitions: Long, partition: Int, offset: Long) extends Product with Serializable
   def main(args: Array[String]): Unit = {
 
     val opts = new RefactorRetentionCommandOptions(args)
@@ -83,26 +73,31 @@ object RefactorRetentionCommand extends Logging {
     try {
       val offsets = consumerGroupService.collectGroupsOffsets(consumerGroupService.getGroups(CONFLUENT_GROUP_PREFIX))
       if (verbose) println(f"We have offsets, not compute stuff")
-      
+
       // topicPartitionOffsets contains [topic: "name", offsets: [ partition, offset ]]
-      val topicPartitionOffsets = 
+      val topicPartitionOffsets =
         offsets.map{ case(groupId, (state, assignments)) =>
           assignments.map{ partitions =>
             partitions.map{ partitionDetails =>
               val topic = partitionDetails.topic.get
+              val topicPartitions = consumerGroupService.getTopicPartitionDetails(topic)
               val p = partitionDetails.partition.get
-              val f = partitionDetails.offset.get
-            
-              if (verbose) println(f"GroupID: $groupId -- Topic $topic -- Partition $p -- Offset $f")
-              TopicPartitionOffset(topic, p, f)
+              var f = partitionDetails.offset.get
+              // Since the Kafka Protocol commits to one past the last message we received,
+              // we must go back one message to identify the timestampt of the message pulled.
+              if (f > 0) f -= 1
+
+              if (verbose) println(f"GroupID: $groupId -- Topic $topic -- Partitions $topicPartitions -- Partition $p -- Offset $f")
+              TopicPartitionOffset(topic, topicPartitions, p, f)
             }
           }
-        }.flatten.flatten.groupBy(tpo => (tpo.topic, tpo.partition))
+        }.flatten.flatten.groupBy(tpo => (tpo.topic, tpo.partitions, tpo.partition))
 
-      // TODO: Likely a better way to do this
+
+      // Build an array of Topic/Partitions to later compute the oldest timestamps
       val tpJoiner = "_Partition:"
       val oldestTopicPartitionOffsets = new HashMap[String, Long]()
-      topicPartitionOffsets.foreach{ case ( (topic, partition), tpoList) =>
+      topicPartitionOffsets.foreach{ case ( (topic, numPartitions, partition), tpoList) =>
         tpoList.foreach{ tpo =>
           val tp = tpo.topic + tpJoiner + tpo.partition
           if (oldestTopicPartitionOffsets.contains(tp)) {
@@ -117,13 +112,21 @@ object RefactorRetentionCommand extends Logging {
 
       // Now that we have the topics, partitions, and old offsets...
       // Pull the timestamp for the message to determine the oldest timestamps
+      if (verbose) println(f"Find the oldest Timestamps for each Topic/Partition Pair")
       val configOverrides = new HashMap[String, String]()
       val consumer = createKafkaClient(opts, configOverrides)
-      val oldestTopicTimestamp = new HashMap[String, Long]()
+      // oldestTopicTimestamp => HashMap(topic, foundPartitions, oldestTimestamp)
+      val oldestTopicTimestamp = new HashMap[String,Long]()
+      val foundTP = new HashSet[String]()
       oldestTopicPartitionOffsets.foreach{ case (tp, offset) =>
         val parts = tp.split(tpJoiner)
         val topic = parts(0)
         val partition = parts(1).toInt
+
+        // The foundTP will be used in the next section to determine if we missed out on any partitions
+        foundTP += tp
+
+        // Find the oldest timestamp for each topic and partition
         val timestamp = getKafkaRecordTimestamp(consumer, topic, partition, offset)
         if (verbose) println(f"Topic: $topic Partition: $partition Offset: $offset Timestamp: $timestamp")
         if (timestamp == -1) {
@@ -136,23 +139,43 @@ object RefactorRetentionCommand extends Logging {
           oldestTopicTimestamp += (topic -> timestamp)
         }
       }
+
+      // Determine if we are missing a partition from the Topics.
+      if (verbose) println(f"Find partitions that do not have any consumer offsets.")
       
-        val topicRetention = computeRetentionTime(opts, oldestTopicTimestamp, consumerGroupService)
-
-        printRetention(topicRetention)
-
-        if (execute) {
-          consumerGroupService.setTopicRetentionTime(topicRetention)
+      //val availableTP = new HashMap[String, Integer]()
+      val availableTP = new HashSet[String]()
+      
+      foundTP.map(_.split(tpJoiner)(0)).map{ topic => 
+        val partitions = consumerGroupService.getTopicPartitionDetails(topic).toInt
+        for (x <- 0 to partitions) {
+          // Build the string to compare with the availableTP Set
+          availableTP += topic + tpJoiner + x
         }
-
-
-      // } else {
-      //   println(f"No retention settings provided. Please specify --retention, --retention-min OR --retention-max, --retention-step")
-      // }
+      }
+      val deltaTP = availableTP diff foundTP
+      val missingTopicPartitions = new HashMap[String,HashSet[Int]]()
+      deltaTP.map{ tp =>
+        val parts = tp.split(tpJoiner)
+        val topic = parts(0)
+        val partition = parts(1).toInt
+        if (!missingTopicPartitions.contains(topic)) {
+          missingTopicPartitions += (topic -> new HashSet[Int]())
+          missingTopicPartitions.get(topic).get += partition
+        } else {
+          missingTopicPartitions.get(topic).get += partition
+        }
+      }
       
 
+      val topicRetention = computeRetentionTime(opts, oldestTopicTimestamp, missingTopicPartitions, consumerGroupService)
 
-      
+      printRetention(topicRetention)
+
+      if (execute) {
+        consumerGroupService.setTopicRetentionTime(topicRetention)
+      }
+
     } catch {
       case e: IllegalArgumentException =>
         CommandLineUtils.printUsageAndExit(opts.parser, e.getMessage)
@@ -190,7 +213,7 @@ object RefactorRetentionCommand extends Logging {
     }
 
   def getKafkaRecordTimestamp(consumer: KafkaConsumer[String, String], topic: String, partition: Int, offset: Long) : Long = {
-    
+
     val tp = new TopicPartition(topic, partition)
     val tpCollection = new ArrayList[TopicPartition]()
     tpCollection.add(tp)
@@ -213,8 +236,6 @@ object RefactorRetentionCommand extends Logging {
         timestamp = -1L
     }
 
-    // 
-    // timestamp = record.timestamp()
     timestamp
   }
 
@@ -259,11 +280,13 @@ object RefactorRetentionCommand extends Logging {
 
   private[admin] case class GroupState(group: String, coordinator: Node, assignmentStrategy: String, state: String, numMembers: Int)
 
-  def computeRetentionTime(opts: RefactorRetentionCommandOptions, oldestTopicTimestamp:HashMap[String, Long], consumerGroupService: ConsumerGroupService ): HashMap[String, HashMap[String, Long]] = {
+  def computeRetentionTime(opts: RefactorRetentionCommandOptions, oldestTopicTimestamp:HashMap[String, Long], missingTopicPartitions:HashMap[String,HashSet[Int]], consumerGroupService: ConsumerGroupService ): HashMap[String, HashMap[String, Long]] = {
 
     // Determine the retention math strategy we will use
     // exact retention vs computed retention
     val topicRetention = new HashMap[String, HashMap[String, Long]]()
+    val verbose = opts.options.has(opts.verboseOpt)
+    val ignoreMissingPartitions = opts.options.has(opts.ignoreMissingPartitionsOpt)
 
     if (opts.options.has(opts.retentionMsOpt)) {
       // val exactRetention = opts.retentionMsOpt
@@ -271,37 +294,60 @@ object RefactorRetentionCommand extends Logging {
 
     } else if  (
         opts.options.has(opts.retentionMinMsOpt) ||
-        opts.options.has(opts.retentionMaxMsOpt) 
+        opts.options.has(opts.retentionMaxMsOpt)
     ) {
       // TODO: Better Scala way to do this? getOrElse perhaps
       val minRetention  = if (opts.options.has(opts.retentionMinMsOpt)) opts.options.valueOf(opts.retentionMinMsOpt) else DEFAULT_RETENTION_MIN
       val maxRetention  = if (opts.options.has(opts.retentionMaxMsOpt)) opts.options.valueOf(opts.retentionMaxMsOpt) else DEFAULT_RETENTION_MAX
       val stepRetention = if (opts.options.has(opts.retentionStepMsOpt)) opts.options.valueOf(opts.retentionStepMsOpt) else DEFAULT_RETENTION_STEP
 
+      if (verbose) {
+        println(f"----------------------------------------")
+        println(f"Retention Values to use for Computations")
+        println(f"Min : $minRetention")
+        println(f"Max : $maxRetention")
+        println(f"Step: $stepRetention")
+      }
       // We will utilize the user's retention values and the topic's oldest timestamp
       val now = Instant.now().toEpochMilli()
-        
+
       oldestTopicTimestamp.foreach{ case(topic, oldestTimestamp) =>
         val currentRetention = consumerGroupService.getTopicRetentionTime(topic)
         val delta = now - oldestTimestamp
-        var proposedRetention = currentRetention
-        if (currentRetention < minRetention) {
+        var proposedRetention = minRetention
+        val missingPartitions = missingTopicPartitions.contains(topic)
+
+        if (verbose) {
+          println(f"Topic: $topic CurrentRetention: $currentRetention NowTS: $now OldestTS: $oldestTimestamp Delta: $delta")
+        }
+        if (missingPartitions && ignoreMissingPartitions) {
+          println(f"WARN: Topic [$topic] has partitions that consumers are not consuming.")
+          println(f"Ignoring the missing partitions due to --ignore-missing-partitions being set")
+        }
+
+        if (missingPartitions && !ignoreMissingPartitions) {
+          println(f"WARN: Topic [$topic] has partitions that consumers are not consuming.")
+          println(f"The topic's retention will not be changed unless --ignore-missing-partitions is set")
+          proposedRetention = currentRetention
+        } else if (currentRetention < minRetention) {
+          if (verbose) println("Choosing minRetention since current is lower")
           proposedRetention = minRetention
         } else {
           var r = minRetention
           var done = false
           while (r < maxRetention && !done) {
+            if (verbose) println(f"Checking $r >= $delta")
             if (r >= delta) {
+              if (verbose) println(f"Using retention $r")
               proposedRetention = r
               done = true
             }
             r += stepRetention
           }
-          if (!done) {
-            // Oldest timestamp was too great, set to max
+          if (!done || proposedRetention > maxRetention) {
+            if (verbose) println("Oldest timestamp was too great, set to max")
             proposedRetention = maxRetention
           }
-        
         }
 
         topicRetention.addOne(topic, HashMap(
@@ -328,6 +374,28 @@ object RefactorRetentionCommand extends Logging {
 
     }
 
+    private val topicDetails = new HashMap[String, TopicDescription]()
+    def getTopicPartitionDetails(topic: String): Long = {
+
+      val topicDescription: TopicDescription = {
+        if (topicDetails.contains(topic))
+          topicDetails.get(topic).get
+        else {
+          val topics = new ListBuffer[String]()
+          topics += topic
+          val describeTopicsResult = adminClient.describeTopics(
+            topics.asJava,
+            withTimeoutMs(new DescribeTopicsOptions))
+          val td = describeTopicsResult.topicNameValues.get(topic).get
+          topicDetails += (topic -> td)
+          td
+        }
+      }
+      val topicPartitions = topicDescription.partitions
+      val numPartitions = topicPartitions.size
+      numPartitions
+    }
+
     def listConsumerGroups(): List[String] = {
       val result = adminClient.listConsumerGroups(withTimeoutMs(new ListConsumerGroupsOptions))
       val listings = result.all.get.asScala
@@ -340,7 +408,7 @@ object RefactorRetentionCommand extends Logging {
       val result = adminClient.listConsumerGroups(listConsumerGroupsOptions)
       result.all.get.asScala.toList
     }
-    
+
     def getGroups(confluentGroupPrefix: String): List[String] = {
       val allGroups = this.listConsumerGroups()
       if (verbose) {
@@ -356,7 +424,7 @@ object RefactorRetentionCommand extends Logging {
       val groupFilter = opts.options.valueOf(opts.groupOpt)
       if (verbose) {
         println("")
-        println("GroupFilter: " + groupFilter)
+        println(f"GroupFilter: $groupFilter")
         println("Groups before supplied filter:")
         println("----------------------------------------")
         if (allGroups.length <= 0)
@@ -370,184 +438,20 @@ object RefactorRetentionCommand extends Logging {
           if (verbose) println("Applying filter...")
           groupsBeforeFilter.filter(_.matches(groupFilter))
         }
-        else 
+        else
           groupsBeforeFilter
 
-      if (verbose && groupFilter.length > 0) {
+      if (verbose && groups.length > 0) {
         println("")
         println("Groups after supplied filter:")
         println("----------------------------------------")
-        if (allGroups.length <= 0)
-          println("No Groups")
-        else allGroups.foreach(println(_))
+        groups.foreach(println(_))
         println("----------------------------------------")
+      } else if (groups.length <= 0) {
+        println(f"No Groups found for [$groupFilter]")
       }
 
       groups
-    }
-
-    // private def printGroupStates(groupsAndStates: List[(String, String)]): Unit = {
-    //   // find proper columns width
-    //   var maxGroupLen = 15
-    //   for ((groupId, _) <- groupsAndStates) {
-    //     maxGroupLen = Math.max(maxGroupLen, groupId.length)
-    //   }
-    //   println(s"%${-maxGroupLen}s %s".format("GROUP", "STATE"))
-    //   for ((groupId, state) <- groupsAndStates) {
-    //     println(s"%${-maxGroupLen}s %s".format(groupId, state))
-    //   }
-    // }
-
-    // private def shouldPrintMemberState(group: String, state: Option[String], numRows: Option[Int]): Boolean = {
-    //   // numRows contains the number of data rows, if any, compiled from the API call in the caller method.
-    //   // if it's undefined or 0, there is no relevant group information to display.
-    //   numRows match {
-    //     case None =>
-    //       printError(s"The consumer group '$group' does not exist.")
-    //       false
-    //     case Some(num) => state match {
-    //       case Some("Dead") =>
-    //         printError(s"Consumer group '$group' does not exist.")
-    //       case Some("Empty") =>
-    //         Console.err.println(s"\nConsumer group '$group' has no active members.")
-    //       case Some("PreparingRebalance") | Some("CompletingRebalance") =>
-    //         Console.err.println(s"\nWarning: Consumer group '$group' is rebalancing.")
-    //       case Some("Stable") =>
-    //       case other =>
-    //         // the control should never reach here
-    //         throw new KafkaException(s"Expected a valid consumer group state, but found '${other.getOrElse("NONE")}'.")
-    //     }
-    //     !state.contains("Dead") && num > 0
-    //   }
-    // }
-
-    // private def size(colOpt: Option[Seq[Object]]): Option[Int] = colOpt.map(_.size)
-
-    // private def printOffsets(offsets: Map[String, (Option[String], Option[Seq[PartitionAssignmentState]])]): Unit = {
-    //   for ((groupId, (state, assignments)) <- offsets) {
-    //     if (shouldPrintMemberState(groupId, state, size(assignments))) {
-    //       // find proper columns width
-    //       var (maxGroupLen, maxTopicLen, maxConsumerIdLen, maxHostLen) = (15, 15, 15, 15)
-    //       assignments match {
-    //         case None => // do nothing
-    //         case Some(consumerAssignments) =>
-    //           consumerAssignments.foreach { consumerAssignment =>
-    //             maxGroupLen = Math.max(maxGroupLen, consumerAssignment.group.length)
-    //             maxTopicLen = Math.max(maxTopicLen, consumerAssignment.topic.getOrElse(MISSING_COLUMN_VALUE).length)
-    //             maxConsumerIdLen = Math.max(maxConsumerIdLen, consumerAssignment.consumerId.getOrElse(MISSING_COLUMN_VALUE).length)
-    //             maxHostLen = Math.max(maxHostLen, consumerAssignment.host.getOrElse(MISSING_COLUMN_VALUE).length)
-    //           }
-    //       }
-
-    //       println(s"\n%${-maxGroupLen}s %${-maxTopicLen}s %-10s %-15s %-15s %-15s %${-maxConsumerIdLen}s %${-maxHostLen}s %s"
-    //         .format("GROUP", "TOPIC", "PARTITION", "CURRENT-OFFSET", "LOG-END-OFFSET", "LAG", "CONSUMER-ID", "HOST", "CLIENT-ID"))
-
-    //       assignments match {
-    //         case None => // do nothing
-    //         case Some(consumerAssignments) =>
-    //           consumerAssignments.foreach { consumerAssignment =>
-    //             println(s"%${-maxGroupLen}s %${-maxTopicLen}s %-10s %-15s %-15s %-15s %${-maxConsumerIdLen}s %${-maxHostLen}s %s".format(
-    //               consumerAssignment.group,
-    //               consumerAssignment.topic.getOrElse(MISSING_COLUMN_VALUE), consumerAssignment.partition.getOrElse(MISSING_COLUMN_VALUE),
-    //               consumerAssignment.offset.getOrElse(MISSING_COLUMN_VALUE), consumerAssignment.logEndOffset.getOrElse(MISSING_COLUMN_VALUE),
-    //               consumerAssignment.lag.getOrElse(MISSING_COLUMN_VALUE), consumerAssignment.consumerId.getOrElse(MISSING_COLUMN_VALUE),
-    //               consumerAssignment.host.getOrElse(MISSING_COLUMN_VALUE), consumerAssignment.clientId.getOrElse(MISSING_COLUMN_VALUE))
-    //             )
-    //           }
-    //       }
-    //     }
-    //   }
-    // }
-
-    // private def printMembers(members: Map[String, (Option[String], Option[Seq[MemberAssignmentState]])], verbose: Boolean): Unit = {
-    //   for ((groupId, (state, assignments)) <- members) {
-    //     if (shouldPrintMemberState(groupId, state, size(assignments))) {
-    //       // find proper columns width
-    //       var (maxGroupLen, maxConsumerIdLen, maxGroupInstanceIdLen, maxHostLen, maxClientIdLen, includeGroupInstanceId) = (15, 15, 17, 15, 15, false)
-    //       assignments match {
-    //         case None => // do nothing
-    //         case Some(memberAssignments) =>
-    //           memberAssignments.foreach { memberAssignment =>
-    //             maxGroupLen = Math.max(maxGroupLen, memberAssignment.group.length)
-    //             maxConsumerIdLen = Math.max(maxConsumerIdLen, memberAssignment.consumerId.length)
-    //             maxGroupInstanceIdLen =  Math.max(maxGroupInstanceIdLen, memberAssignment.groupInstanceId.length)
-    //             maxHostLen = Math.max(maxHostLen, memberAssignment.host.length)
-    //             maxClientIdLen = Math.max(maxClientIdLen, memberAssignment.clientId.length)
-    //             includeGroupInstanceId = includeGroupInstanceId || memberAssignment.groupInstanceId.nonEmpty
-    //           }
-    //       }
-
-    //       if (includeGroupInstanceId) {
-    //         print(s"\n%${-maxGroupLen}s %${-maxConsumerIdLen}s %${-maxGroupInstanceIdLen}s %${-maxHostLen}s %${-maxClientIdLen}s %-15s "
-    //             .format("GROUP", "CONSUMER-ID", "GROUP-INSTANCE-ID", "HOST", "CLIENT-ID", "#PARTITIONS"))
-    //       } else {
-    //         print(s"\n%${-maxGroupLen}s %${-maxConsumerIdLen}s %${-maxHostLen}s %${-maxClientIdLen}s %-15s "
-    //             .format("GROUP", "CONSUMER-ID", "HOST", "CLIENT-ID", "#PARTITIONS"))
-    //       }
-    //       if (verbose)
-    //         print(s"%s".format("ASSIGNMENT"))
-    //       println()
-
-    //       assignments match {
-    //         case None => // do nothing
-    //         case Some(memberAssignments) =>
-    //           memberAssignments.foreach { memberAssignment =>
-    //             if (includeGroupInstanceId) {
-    //               print(s"%${-maxGroupLen}s %${-maxConsumerIdLen}s %${-maxGroupInstanceIdLen}s %${-maxHostLen}s %${-maxClientIdLen}s %-15s ".format(
-    //                 memberAssignment.group, memberAssignment.consumerId, memberAssignment.groupInstanceId, memberAssignment.host,
-    //                 memberAssignment.clientId, memberAssignment.numPartitions))
-    //             } else {
-    //               print(s"%${-maxGroupLen}s %${-maxConsumerIdLen}s %${-maxHostLen}s %${-maxClientIdLen}s %-15s ".format(
-    //                 memberAssignment.group, memberAssignment.consumerId, memberAssignment.host, memberAssignment.clientId, memberAssignment.numPartitions))
-    //             }
-    //             if (verbose) {
-    //               val partitions = memberAssignment.assignment match {
-    //                 case List() => MISSING_COLUMN_VALUE
-    //                 case assignment =>
-    //                   assignment.groupBy(_.topic).map {
-    //                     case (topic, partitionList) => topic + partitionList.map(_.partition).sorted.mkString("(", ",", ")")
-    //                   }.toList.sorted.mkString(", ")
-    //               }
-    //               print(s"%s".format(partitions))
-    //             }
-    //             println()
-    //           }
-    //       }
-    //     }
-    //   }
-    // }
-
-    // private def printStates(states: Map[String, GroupState]): Unit = {
-    //   for ((groupId, state) <- states) {
-    //     if (shouldPrintMemberState(groupId, Some(state.state), Some(1))) {
-    //       val coordinator = s"${state.coordinator.host}:${state.coordinator.port} (${state.coordinator.idString})"
-    //       val coordinatorColLen = Math.max(25, coordinator.length)
-    //       print(s"\n%${-coordinatorColLen}s %-25s %-20s %-15s %s".format("GROUP", "COORDINATOR (ID)", "ASSIGNMENT-STRATEGY", "STATE", "#MEMBERS"))
-    //       print(s"\n%${-coordinatorColLen}s %-25s %-20s %-15s %s".format(state.group, coordinator, state.assignmentStrategy, state.state, state.numMembers))
-    //       println()
-    //     }
-    //   }
-    // }
-
-    def describeGroups(): Unit = {
-      // val groupIds =
-      //   if (opts.options.has(opts.allGroupsOpt)) listConsumerGroups()
-      //   else opts.options.valuesOf(opts.groupOpt).asScala
-      // val membersOptPresent = opts.options.has(opts.membersOpt)
-      // val stateOptPresent = opts.options.has(opts.stateOpt)
-      // val offsetsOptPresent = opts.options.has(opts.offsetsOpt)
-      // val subActions = Seq(membersOptPresent, offsetsOptPresent, stateOptPresent).count(_ == true)
-
-      // if (subActions == 0 || offsetsOptPresent) {
-      //   val offsets = collectGroupsOffsets(groupIds)
-      //   printOffsets(offsets)
-      // } else if (membersOptPresent) {
-      //   val members = collectGroupsMembers(groupIds, opts.options.has(opts.verboseOpt))
-      //   printMembers(members, opts.options.has(opts.verboseOpt))
-      // } else {
-      //   val states = collectGroupsState(groupIds)
-      //   printStates(states)
-      // }
     }
 
     private def collectConsumerAssignment(group: String,
@@ -592,43 +496,6 @@ object RefactorRetentionCommand extends Logging {
           }
       }.toArray
     }
-
-    // def resetOffsets(): Map[String, Map[TopicPartition, OffsetAndMetadata]] = {
-    //   val groupIds =
-    //     if (opts.options.has(opts.allGroupsOpt)) listConsumerGroups()
-    //     else opts.options.valuesOf(opts.groupOpt).asScala
-
-    //   val consumerGroups = adminClient.describeConsumerGroups(
-    //     groupIds.asJava,
-    //     withTimeoutMs(new DescribeConsumerGroupsOptions)
-    //   ).describedGroups()
-
-    //   val result =
-    //     consumerGroups.asScala.foldLeft(immutable.Map[String, Map[TopicPartition, OffsetAndMetadata]]()) {
-    //       case (acc, (groupId, groupDescription)) =>
-    //         groupDescription.get.state().toString match {
-    //           case "Empty" | "Dead" =>
-    //             val partitionsToReset = getPartitionsToReset(groupId)
-    //             val preparedOffsets = prepareOffsetsToReset(groupId, partitionsToReset)
-
-    //             // Dry-run is the default behavior if --execute is not specified
-    //             val dryRun = opts.options.has(opts.dryRunOpt) || !opts.options.has(opts.executeOpt)
-    //             if (!dryRun) {
-    //               adminClient.alterConsumerGroupOffsets(
-    //                 groupId,
-    //                 preparedOffsets.asJava,
-    //                 withTimeoutMs(new AlterConsumerGroupOffsetsOptions)
-    //               ).all.get
-    //             }
-    //             acc.updated(groupId, preparedOffsets)
-    //           case currentState =>
-    //             printError(s"Assignments can only be reset if the group '$groupId' is inactive, but the current state is $currentState.")
-    //             acc.updated(groupId, Map.empty)
-    //         }
-    //     }
-    //   result
-    // }
-
 
     def deleteOffsets(groupId: String, topics: List[String]): (Errors, Map[TopicPartition, Throwable]) = {
       val partitionLevelResult = mutable.Map[TopicPartition, Throwable]()
@@ -719,13 +586,6 @@ object RefactorRetentionCommand extends Logging {
         case (groupId, groupDescriptionFuture) => (groupId, groupDescriptionFuture.get())
       }
     }
-
-    /**
-      * Returns the state of the specified consumer group and partition assignment states
-      */
-    // def collectGroupOffsets(groupId: String): (Option[String], Option[Seq[PartitionAssignmentState]]) = {
-    //   collectGroupsOffsets(List(groupId)).getOrElse(groupId, (None, None))
-    // }
 
     /**
       * Returns states of the specified consumer groups and partition assignment states
@@ -821,46 +681,22 @@ object RefactorRetentionCommand extends Logging {
       }.toMap
     }
 
-    
+    def getTopicPartition(topic:String): Long = {
+      var retentionMs = 0L
+      val configResource = new ConfigResource(ConfigResource.Type.TOPIC, topic)
+      val configs = adminClient.describeConfigs(Collections.singleton(configResource)).all.get(30, TimeUnit.SECONDS)
+      val retentionMsConfig = configs.get(configResource).entries().asScala
+                         .filter(item => "retention.ms".equals(item.name))
+                         .map( x => {
+                          val value = x.value().toLong
+                          if (value > 0L) {
+                            value
+                          }
+                         })
 
-    // private def getLogStartOffsets(groupId: String, topicPartitions: Seq[TopicPartition]): Map[TopicPartition, LogOffsetResult] = {
-    //   val startOffsets = topicPartitions.map { topicPartition =>
-    //     topicPartition -> OffsetSpec.earliest
-    //   }.toMap
-    //   val offsets = adminClient.listOffsets(
-    //     startOffsets.asJava,
-    //     withTimeoutMs(new ListOffsetsOptions)
-    //   ).all.get
-    //   topicPartitions.map { topicPartition =>
-    //     Option(offsets.get(topicPartition)) match {
-    //       case Some(listOffsetsResultInfo) => topicPartition -> LogOffsetResult.LogOffset(listOffsetsResultInfo.offset)
-    //       case _ => topicPartition -> LogOffsetResult.Unknown
-    //     }
-    //   }.toMap
-    // }
-
-    // private def getLogTimestampOffsets(groupId: String, topicPartitions: Seq[TopicPartition], timestamp: java.lang.Long): Map[TopicPartition, LogOffsetResult] = {
-    //   val timestampOffsets = topicPartitions.map { topicPartition =>
-    //     topicPartition -> OffsetSpec.forTimestamp(timestamp)
-    //   }.toMap
-    //   val offsets = adminClient.listOffsets(
-    //     timestampOffsets.asJava,
-    //     withTimeoutMs(new ListOffsetsOptions)
-    //   ).all.get
-    //   val (successfulOffsetsForTimes, unsuccessfulOffsetsForTimes) =
-    //     offsets.asScala.partition(_._2.offset != ListOffsetsResponse.UNKNOWN_OFFSET)
-
-    //   val successfulLogTimestampOffsets = successfulOffsetsForTimes.map {
-    //     case (topicPartition, listOffsetsResultInfo) => topicPartition -> LogOffsetResult.LogOffset(listOffsetsResultInfo.offset)
-    //   }.toMap
-
-    //   unsuccessfulOffsetsForTimes.foreach { entry =>
-    //     println(s"\nWarn: Partition " + entry._1.partition() + " from topic " + entry._1.topic() +
-    //       " is empty. Falling back to latest known offset.")
-    //   }
-
-    //   successfulLogTimestampOffsets ++ getLogEndOffsets(groupId, unsuccessfulOffsetsForTimes.keySet.toSeq)
-    // }
+      retentionMs = retentionMsConfig.head.asInstanceOf[Number].longValue
+      retentionMs
+    }
 
     def getTopicRetentionTime(topic:String): Long = {
       var retentionMs = 0L
@@ -876,7 +712,6 @@ object RefactorRetentionCommand extends Logging {
                          })
 
       retentionMs = retentionMsConfig.head.asInstanceOf[Number].longValue
-
       retentionMs
     }
 
@@ -894,10 +729,8 @@ object RefactorRetentionCommand extends Logging {
           println(f"Skipping setting retention for $topic due to a bad proposed value.")
         }
       }
-      
 
       adminClient.incrementalAlterConfigs(configs.asJava).all().get()
-
     }
 
     def close(): Unit = {
@@ -934,194 +767,12 @@ object RefactorRetentionCommand extends Logging {
       }
     }
 
-    // private def parseTopicPartitionsToReset(topicArgs: Seq[String]): Seq[TopicPartition] = {
-    //   val (topicsWithPartitions, topics) = topicArgs.partition(_.contains(":"))
-    //   val specifiedPartitions = topicsWithPartitions.flatMap(parseTopicsWithPartitions)
-
-    //   val unspecifiedPartitions = if (topics.nonEmpty) {
-    //     val descriptionMap = adminClient.describeTopics(
-    //       topics.asJava,
-    //       withTimeoutMs(new DescribeTopicsOptions)
-    //     ).allTopicNames().get.asScala
-    //     descriptionMap.flatMap { case (topic, description) =>
-    //       description.partitions().asScala.map { tpInfo =>
-    //         new TopicPartition(topic, tpInfo.partition)
-    //       }
-    //     }
-    //   } else
-    //     Seq.empty
-    //   specifiedPartitions ++ unspecifiedPartitions
-    // }
-
-    // private def getPartitionsToReset(groupId: String): Seq[TopicPartition] = {
-    //   if (opts.options.has(opts.allTopicsOpt)) {
-    //     getCommittedOffsets(groupId).keys.toSeq
-    //   } else if (opts.options.has(opts.topicOpt)) {
-    //     val topics = opts.options.valuesOf(opts.topicOpt).asScala
-    //     parseTopicPartitionsToReset(topics)
-    //   } else {
-    //     if (opts.options.has(opts.resetFromFileOpt))
-    //       Nil
-    //     else
-    //       ToolsUtils.printUsageAndExit(opts.parser, "One of the reset scopes should be defined: --all-topics, --topic.")
-    //   }
-    // }
-
     private def getCommittedOffsets(groupId: String): Map[TopicPartition, OffsetAndMetadata] = {
       adminClient.listConsumerGroupOffsets(
         Collections.singletonMap(groupId, new ListConsumerGroupOffsetsSpec),
         withTimeoutMs(new ListConsumerGroupOffsetsOptions())
       ).partitionsToOffsetAndMetadata(groupId).get().asScala
     }
-
-    // type GroupMetadata = immutable.Map[String, immutable.Map[TopicPartition, OffsetAndMetadata]]
-    // private def parseResetPlan(resetPlanCsv: String): GroupMetadata = {
-    //   def updateGroupMetadata(group: String, topic: String, partition: Int, offset: Long, acc: GroupMetadata) = {
-    //     val topicPartition = new TopicPartition(topic, partition)
-    //     val offsetAndMetadata = new OffsetAndMetadata(offset)
-    //     val dataMap = acc.getOrElse(group, immutable.Map()).updated(topicPartition, offsetAndMetadata)
-    //     acc.updated(group, dataMap)
-    //   }
-    //   val csvReader = CsvUtils().readerFor[CsvRecordNoGroup]
-    //   val lines = resetPlanCsv.split("\n")
-    //   val isSingleGroupQuery = opts.options.valuesOf(opts.groupOpt).size() == 1
-    //   val isOldCsvFormat = lines.headOption.flatMap(line =>
-    //     Try(csvReader.readValue[CsvRecordNoGroup](line)).toOption).nonEmpty
-    //   // Single group CSV format: "topic,partition,offset"
-    //   val dataMap = if (isSingleGroupQuery && isOldCsvFormat) {
-    //     val group = opts.options.valueOf(opts.groupOpt)
-    //     lines.foldLeft(immutable.Map[String, immutable.Map[TopicPartition, OffsetAndMetadata]]()) { (acc, line) =>
-    //       val CsvRecordNoGroup(topic, partition, offset) = csvReader.readValue[CsvRecordNoGroup](line)
-    //       updateGroupMetadata(group, topic, partition, offset, acc)
-    //     }
-    //     // Multiple group CSV format: "group,topic,partition,offset"
-    //   } else {
-    //     val csvReader = CsvUtils().readerFor[CsvRecordWithGroup]
-    //     lines.foldLeft(immutable.Map[String, immutable.Map[TopicPartition, OffsetAndMetadata]]()) { (acc, line) =>
-    //       val CsvRecordWithGroup(group, topic, partition, offset) = csvReader.readValue[CsvRecordWithGroup](line)
-    //       updateGroupMetadata(group, topic, partition, offset, acc)
-    //     }
-    //   }
-    //   dataMap
-    // }
-
-    // private def prepareOffsetsToReset(groupId: String,
-    //                                   partitionsToReset: Seq[TopicPartition]): Map[TopicPartition, OffsetAndMetadata] = {
-    //   if (opts.options.has(opts.resetToOffsetOpt)) {
-    //     val offset = opts.options.valueOf(opts.resetToOffsetOpt)
-    //     checkOffsetsRange(groupId, partitionsToReset.map((_, offset)).toMap).map {
-    //       case (topicPartition, newOffset) => (topicPartition, new OffsetAndMetadata(newOffset))
-    //     }
-    //   } else if (opts.options.has(opts.resetToEarliestOpt)) {
-    //     val logStartOffsets = getLogStartOffsets(groupId, partitionsToReset)
-    //     partitionsToReset.map { topicPartition =>
-    //       logStartOffsets.get(topicPartition) match {
-    //         case Some(LogOffsetResult.LogOffset(offset)) => (topicPartition, new OffsetAndMetadata(offset))
-    //         case _ => ToolsUtils.printUsageAndExit(opts.parser, s"Error getting starting offset of topic partition: $topicPartition")
-    //       }
-    //     }.toMap
-    //   } else if (opts.options.has(opts.resetToLatestOpt)) {
-    //     val logEndOffsets = getLogEndOffsets(groupId, partitionsToReset)
-    //     partitionsToReset.map { topicPartition =>
-    //       logEndOffsets.get(topicPartition) match {
-    //         case Some(LogOffsetResult.LogOffset(offset)) => (topicPartition, new OffsetAndMetadata(offset))
-    //         case _ => ToolsUtils.printUsageAndExit(opts.parser, s"Error getting ending offset of topic partition: $topicPartition")
-    //       }
-    //     }.toMap
-    //   } else if (opts.options.has(opts.resetShiftByOpt)) {
-    //     val currentCommittedOffsets = getCommittedOffsets(groupId)
-    //     val requestedOffsets = partitionsToReset.map { topicPartition =>
-    //       val shiftBy = opts.options.valueOf(opts.resetShiftByOpt)
-    //       val currentOffset = currentCommittedOffsets.getOrElse(topicPartition,
-    //         throw new IllegalArgumentException(s"Cannot shift offset for partition $topicPartition since there is no current committed offset")).offset
-    //       (topicPartition, currentOffset + shiftBy)
-    //     }.toMap
-    //     checkOffsetsRange(groupId, requestedOffsets).map {
-    //       case (topicPartition, newOffset) => (topicPartition, new OffsetAndMetadata(newOffset))
-    //     }
-    //   } else if (opts.options.has(opts.resetToDatetimeOpt)) {
-    //     val timestamp = Utils.getDateTime(opts.options.valueOf(opts.resetToDatetimeOpt))
-    //     val logTimestampOffsets = getLogTimestampOffsets(groupId, partitionsToReset, timestamp)
-    //     partitionsToReset.map { topicPartition =>
-    //       val logTimestampOffset = logTimestampOffsets.get(topicPartition)
-    //       logTimestampOffset match {
-    //         case Some(LogOffsetResult.LogOffset(offset)) => (topicPartition, new OffsetAndMetadata(offset))
-    //         case _ => ToolsUtils.printUsageAndExit(opts.parser, s"Error getting offset by timestamp of topic partition: $topicPartition")
-    //       }
-    //     }.toMap
-    //   } else if (opts.options.has(opts.resetByDurationOpt)) {
-    //     val duration = opts.options.valueOf(opts.resetByDurationOpt)
-    //     val durationParsed = Duration.parse(duration)
-    //     val now = Instant.now()
-    //     durationParsed.negated().addTo(now)
-    //     val timestamp = now.minus(durationParsed).toEpochMilli
-    //     val logTimestampOffsets = getLogTimestampOffsets(groupId, partitionsToReset, timestamp)
-    //     partitionsToReset.map { topicPartition =>
-    //       val logTimestampOffset = logTimestampOffsets.get(topicPartition)
-    //       logTimestampOffset match {
-    //         case Some(LogOffsetResult.LogOffset(offset)) => (topicPartition, new OffsetAndMetadata(offset))
-    //         case _ => ToolsUtils.printUsageAndExit(opts.parser, s"Error getting offset by timestamp of topic partition: $topicPartition")
-    //       }
-    //     }.toMap
-    //   } else if (resetPlanFromFile.isDefined) {
-    //     resetPlanFromFile.map(resetPlan => resetPlan.get(groupId).map { resetPlanForGroup =>
-    //       val requestedOffsets = resetPlanForGroup.keySet.map { topicPartition =>
-    //         topicPartition -> resetPlanForGroup(topicPartition).offset
-    //       }.toMap
-    //       checkOffsetsRange(groupId, requestedOffsets).map {
-    //         case (topicPartition, newOffset) => (topicPartition, new OffsetAndMetadata(newOffset))
-    //       }
-    //     } match {
-    //       case Some(resetPlanForGroup) => resetPlanForGroup
-    //       case None =>
-    //         printError(s"No reset plan for group $groupId found")
-    //         Map[TopicPartition, OffsetAndMetadata]()
-    //     }).getOrElse(Map.empty)
-    //   } else if (opts.options.has(opts.resetToCurrentOpt)) {
-    //     val currentCommittedOffsets = getCommittedOffsets(groupId)
-    //     val (partitionsToResetWithCommittedOffset, partitionsToResetWithoutCommittedOffset) =
-    //       partitionsToReset.partition(currentCommittedOffsets.keySet.contains(_))
-
-    //     val preparedOffsetsForPartitionsWithCommittedOffset = partitionsToResetWithCommittedOffset.map { topicPartition =>
-    //       (topicPartition, new OffsetAndMetadata(currentCommittedOffsets.get(topicPartition) match {
-    //         case Some(offset) => offset.offset
-    //         case None => throw new IllegalStateException(s"Expected a valid current offset for topic partition: $topicPartition")
-    //       }))
-    //     }.toMap
-
-    //     val preparedOffsetsForPartitionsWithoutCommittedOffset = getLogEndOffsets(groupId, partitionsToResetWithoutCommittedOffset).map {
-    //       case (topicPartition, LogOffsetResult.LogOffset(offset)) => (topicPartition, new OffsetAndMetadata(offset))
-    //       case (topicPartition, _) => ToolsUtils.printUsageAndExit(opts.parser, s"Error getting ending offset of topic partition: $topicPartition")
-    //     }
-
-    //     preparedOffsetsForPartitionsWithCommittedOffset ++ preparedOffsetsForPartitionsWithoutCommittedOffset
-    //   } else {
-    //     ToolsUtils.printUsageAndExit(opts.parser, "Option '%s' requires one of the following scenarios: %s".format(opts.resetOffsetsOpt, opts.allResetOffsetScenarioOpts))
-    //   }
-    // }
-
-    // private def checkOffsetsRange(groupId: String, requestedOffsets: Map[TopicPartition, Long]) = {
-    //   val logStartOffsets = getLogStartOffsets(groupId, requestedOffsets.keySet.toSeq)
-    //   val logEndOffsets = getLogEndOffsets(groupId, requestedOffsets.keySet.toSeq)
-    //   requestedOffsets.map { case (topicPartition, offset) => (topicPartition,
-    //     logEndOffsets.get(topicPartition) match {
-    //       case Some(LogOffsetResult.LogOffset(endOffset)) if offset > endOffset =>
-    //         warn(s"New offset ($offset) is higher than latest offset for topic partition $topicPartition. Value will be set to $endOffset")
-    //         endOffset
-
-    //       case Some(_) => logStartOffsets.get(topicPartition) match {
-    //         case Some(LogOffsetResult.LogOffset(startOffset)) if offset < startOffset =>
-    //           warn(s"New offset ($offset) is lower than earliest offset for topic partition $topicPartition. Value will be set to $startOffset")
-    //           startOffset
-
-    //         case _ => offset
-    //       }
-
-    //       case None => // the control should not reach here
-    //         throw new IllegalStateException(s"Unexpected non-existing offset value for topic partition $topicPartition")
-    //     })
-    //   }
-    // }
 
     def deleteGroups(): Map[String, Throwable] = {
       val groupIds =
@@ -1160,8 +811,6 @@ object RefactorRetentionCommand extends Logging {
     }
   }
 
-
-
   sealed trait LogOffsetResult
 
   object LogOffsetResult {
@@ -1172,9 +821,10 @@ object RefactorRetentionCommand extends Logging {
 
   class RefactorRetentionCommandOptions(args: Array[String]) extends CommandDefaultOptions(args) {
     val BootstrapServerDoc = "REQUIRED: The server(s) to connect to."
-    val TimeoutMsDoc = "The timeout that can be set for some use cases. For example, it can be used when describing the group " +
-      "to specify the maximum amount of time in milliseconds to wait before the group stabilizes (when the group is just created, " +
-      "or is going through some changes)."
+    val TimeoutMsDoc = "The timeout that can be set for some use cases. " +
+                       "For example, it can be used when describing the group " +
+                       "to specify the maximum amount of time in milliseconds to wait before the group stabilizes " +
+                       "(when the group is just created, or is going through some changes)."
     val GroupDoc = "The consumer group(s) we wish to act on. " +
                    "Example: --group enrich-*,route-*,ext-*"
     val AllGroupsDoc = "All consumer group(s) besides internal, ksql, and connect will be included."
@@ -1187,6 +837,9 @@ object RefactorRetentionCommand extends Logging {
     val RetentionStepMsDoc = "Amount of (milliseconds) time to reduce/increase a topic by (default = 1 hour)"
     val CommandConfigDoc = "Property file containing configs to be passed to Admin Client and Consumer."
     val ExecuteDoc = "Execute operation. If the user does not `--execute` the plan will be exported, but nothing will actually change."
+    val IgnoreMissingDoc = "Some consumers will not be consuming all partitions of a topic. "+
+                           "In these circumstances this script will attempt to keep what is already set. "+ 
+                           "Use this setting to force refactoring of the topic."
     val VerboseDoc = "Provide additional information, if any, when describing the group or calculating the retention times."
 
     val bootstrapServerOpt = parser.accepts("bootstrap-server", BootstrapServerDoc)
@@ -1231,6 +884,7 @@ object RefactorRetentionCommand extends Logging {
                                  .describedAs("command config property file")
                                  .ofType(classOf[String])
     val executeOpt = parser.accepts("execute", ExecuteDoc)
+    val ignoreMissingPartitionsOpt = parser.accepts("ignore-missing-partitions", IgnoreMissingDoc)
     val verboseOpt = parser.accepts("verbose", VerboseDoc)
 
     options = parser.parse(args : _*)
@@ -1258,10 +912,6 @@ object RefactorRetentionCommand extends Logging {
       if (!options.has(executeOpt)) {
           Console.err.println("WARN: No action will be performed as the --execute option is missing.")
       }
-
-      // CommandLineUtils.checkInvalidArgs(parser, options, groupOpt, (allGroupSelectionScopeOpts - groupOpt).asJava)
-      // CommandLineUtils.checkInvalidArgs(parser, options, groupOpt, (allConsumerGroupLevelOpts - describeOpt - deleteOpt - resetOffsetsOpt).asJava)
-      // CommandLineUtils.checkInvalidArgs(parser, options, topicOpt, (allConsumerGroupLevelOpts - deleteOpt - resetOffsetsOpt).asJava )
     }
   }
 }
