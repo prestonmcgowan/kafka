@@ -82,7 +82,9 @@ object RefactorRetentionCommand extends Logging {
               val topic = partitionDetails.topic.get
               val topicPartitions = consumerGroupService.getTopicPartitionDetails(topic)
               val p = partitionDetails.partition.get
-              var f = partitionDetails.offset.get
+              val offset = partitionDetails.offset
+              var f = 0L
+              if (offset != None) f = offset.get
               // Since the Kafka Protocol commits to one past the last message we received,
               // we must go back one message to identify the timestampt of the message pulled.
               if (f > 0) f -= 1
@@ -188,8 +190,11 @@ object RefactorRetentionCommand extends Logging {
 
 
   def printRetention(topicRetention: HashMap[String, HashMap[String, Long]]): Unit = {
-    if (topicRetention.nonEmpty)
+    if (topicRetention.isEmpty)
+      println("No topics found to compute retention for. Perhaps the data has already been removed.")
+    else
       println("\n%-60s %-16s %-16s".format("TOPIC", "RETENTION", "NEW-RETENTION"))
+
     for {
       (topic, topicRetention) <- topicRetention
     } {
@@ -350,14 +355,14 @@ object RefactorRetentionCommand extends Logging {
           }
         }
 
-        topicRetention.addOne(topic, HashMap(
+        topicRetention += topic -> HashMap(
           "current" -> currentRetention,
           "proposed" -> proposedRetention,
           "delta" -> delta,
           "minRetention" -> minRetention,
           "maxRetention" -> maxRetention,
           "stepRetention" -> stepRetention
-        ))
+        )
       }
     }
     topicRetention

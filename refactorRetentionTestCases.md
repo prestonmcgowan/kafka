@@ -552,3 +552,18 @@ bin/kafka-refactor-retention.sh --bootstrap-server ${BROKER}:9095 --group con.* 
 ## TEST: 3T3CG with One Very Laggy Partition
 
 ## TEST: Lots of Partitions
+
+## TEST: Lots of Missing Partitions
+
+
+
+## Extra Notes
+
+Describe all topics from these tests
+
+```
+bin/kafka-topics.sh  --bootstrap-server ${BROKER}:9095  --topic foo.a --describe | grep retention
+bin/kafka-topics.sh  --bootstrap-server ${BROKER}:9095  --topic foo.b --describe | grep retention
+bin/kafka-topics.sh  --bootstrap-server ${BROKER}:9095  --topic foo.c --describe | grep retention
+bin/kafka-topics.sh  --bootstrap-server ${BROKER}:9095  --topic foo.large --describe | grep retention
+```
