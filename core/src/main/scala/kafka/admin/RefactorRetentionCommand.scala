@@ -28,7 +28,7 @@ import org.apache.kafka.common.ConsumerGroupState
 
 object RefactorRetentionCommand extends Logging {
 
-  val CONFLUENT_GROUP_PREFIX = "^_confluent-.*"
+  val DEFAULT_CONFLUENT_GROUP_PREFIX = "^_confluent-.*"
   val DEFAULT_RETENTION = 345600000L
   val DEFAULT_RETENTION_MIN = 3600000L
   val DEFAULT_RETENTION_MAX = 604800000L
@@ -69,9 +69,12 @@ object RefactorRetentionCommand extends Logging {
 
     val verbose = opts.options.has(opts.verboseOpt)
     val execute = opts.options.has(opts.executeOpt)
+    val confluentGroupPrefix = if (opts.options.has(opts.confluentGroupPrefixOpt)) opts.options.valueOf(opts.confluentGroupPrefixOpt) else DEFAULT_CONFLUENT_GROUP_PREFIX;
+
+
     val consumerGroupService = new ConsumerGroupService(opts)
     try {
-      val offsets = consumerGroupService.collectGroupsOffsets(consumerGroupService.getGroups(CONFLUENT_GROUP_PREFIX))
+      val offsets = consumerGroupService.collectGroupsOffsets(consumerGroupService.getGroups(confluentGroupPrefix))
       if (verbose) println(f"We have offsets, not compute stuff")
 
       // topicPartitionOffsets contains [topic: "name", offsets: [ partition, offset ]]
@@ -149,13 +152,17 @@ object RefactorRetentionCommand extends Logging {
       val availableTP = new HashSet[String]()
       
       foundTP.map(_.split(tpJoiner)(0)).map{ topic => 
-        val partitions = consumerGroupService.getTopicPartitionDetails(topic).toInt
+        val partitions = consumerGroupService.getTopicPartitionDetails(topic).toInt - 1
         for (x <- 0 to partitions) {
           // Build the string to compare with the availableTP Set
           availableTP += topic + tpJoiner + x
         }
       }
       val deltaTP = availableTP diff foundTP
+      if (verbose) {
+        println(f"deltaTP = availableTP diff foundTP")
+        println(deltaTP.toString())
+      }
       val missingTopicPartitions = new HashMap[String,HashSet[Int]]()
       deltaTP.map{ tp =>
         val parts = tp.split(tpJoiner)
@@ -296,11 +303,7 @@ object RefactorRetentionCommand extends Logging {
     if (opts.options.has(opts.retentionMsOpt)) {
       // val exactRetention = opts.retentionMsOpt
       println("TODO: Implement Exact Retention Strategy")
-
-    } else if  (
-        opts.options.has(opts.retentionMinMsOpt) ||
-        opts.options.has(opts.retentionMaxMsOpt)
-    ) {
+    } else {
       // TODO: Better Scala way to do this? getOrElse perhaps
       val minRetention  = if (opts.options.has(opts.retentionMinMsOpt)) opts.options.valueOf(opts.retentionMinMsOpt) else DEFAULT_RETENTION_MIN
       val maxRetention  = if (opts.options.has(opts.retentionMaxMsOpt)) opts.options.valueOf(opts.retentionMaxMsOpt) else DEFAULT_RETENTION_MAX
@@ -354,6 +357,7 @@ object RefactorRetentionCommand extends Logging {
             proposedRetention = maxRetention
           }
         }
+      
 
         topicRetention += topic -> HashMap(
           "current" -> currentRetention,
@@ -365,6 +369,7 @@ object RefactorRetentionCommand extends Logging {
         )
       }
     }
+    
     topicRetention
   }
 
@@ -833,6 +838,7 @@ object RefactorRetentionCommand extends Logging {
     val GroupDoc = "The consumer group(s) we wish to act on. " +
                    "Example: --group enrich-*,route-*,ext-*"
     val AllGroupsDoc = "All consumer group(s) besides internal, ksql, and connect will be included."
+    val confluentGroupPrefixDoc = "The consumer group prefix that Confluent components will utilize"
     val TopicDoc = "The specific topic(s) we want to apply the changes to."
     val AllTopicsDoc = "Consider all topics assigned to a group in the `refactor` process."
     val nl = System.getProperty("line.separator")
@@ -864,6 +870,11 @@ object RefactorRetentionCommand extends Logging {
                                 .withRequiredArg
                                 .describedAs("consumer group")
                                 .ofType(classOf[String])
+    val confluentGroupPrefixOpt = parser.accepts("confluent-prefix", confluentGroupPrefixDoc)
+                                .withRequiredArg
+                                .describedAs("confluent reserved consumer group")
+                                .ofType(classOf[String])
+                                .defaultsTo(DEFAULT_CONFLUENT_GROUP_PREFIX)
     val topicOpt = parser.accepts("topic", TopicDoc)
                          .withRequiredArg
                          .describedAs("topic")
@@ -872,18 +883,22 @@ object RefactorRetentionCommand extends Logging {
                                .withRequiredArg
                                .describedAs("timeout (ms)")
                                .ofType(classOf[Long])
+                               .defaultsTo(DEFAULT_RETENTION)
     val retentionMinMsOpt = parser.accepts("retention-min", RetentionMinMsDoc)
                                   .withRequiredArg
                                   .describedAs("timeout (ms)")
                                   .ofType(classOf[Long])
+                                  .defaultsTo(DEFAULT_RETENTION_MIN)
     val retentionMaxMsOpt = parser.accepts("retention-max", RetentionMaxMsDoc)
                                   .withRequiredArg
                                   .describedAs("timeout (ms)")
                                   .ofType(classOf[Long])
+                                  .defaultsTo(DEFAULT_RETENTION_MAX)
     val retentionStepMsOpt = parser.accepts("retention-step", RetentionStepMsDoc)
                                    .withRequiredArg
                                    .describedAs("timeout (ms)")
                                    .ofType(classOf[Long])
+                                   .defaultsTo(DEFAULT_RETENTION_STEP)
     val commandConfigOpt = parser.accepts("command-config", CommandConfigDoc)
                                  .withRequiredArg
                                  .describedAs("command config property file")
