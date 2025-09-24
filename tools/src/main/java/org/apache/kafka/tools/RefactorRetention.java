@@ -27,7 +27,6 @@ import org.apache.kafka.clients.admin.AlterConfigOp;
 import org.apache.kafka.clients.admin.AlterConfigsOptions;
 import org.apache.kafka.clients.admin.ConfigEntry;
 import org.apache.kafka.clients.admin.ConsumerGroupDescription;
-import org.apache.kafka.clients.admin.ConsumerGroupListing;
 import org.apache.kafka.clients.admin.DeleteConsumerGroupOffsetsOptions;
 import org.apache.kafka.clients.admin.DeleteConsumerGroupsOptions;
 import org.apache.kafka.clients.admin.DescribeClusterOptions;
@@ -36,7 +35,6 @@ import org.apache.kafka.clients.admin.DescribeConsumerGroupsOptions;
 import org.apache.kafka.clients.admin.DescribeTopicsOptions;
 import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsOptions;
 import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsSpec;
-import org.apache.kafka.clients.admin.ListConsumerGroupsOptions;
 import org.apache.kafka.clients.admin.ListOffsetsOptions;
 import org.apache.kafka.clients.admin.ListTopicsOptions;
 import org.apache.kafka.clients.admin.MemberDescription;
@@ -45,7 +43,6 @@ import org.apache.kafka.clients.admin.TopicDescription;
 import org.apache.kafka.clients.consumer.InvalidOffsetException;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
-import org.apache.kafka.common.ConsumerGroupState;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.ConfigResource;
@@ -55,6 +52,7 @@ import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.server.util.CommandDefaultOptions;
 import org.apache.kafka.server.util.CommandLineUtils;
 
+import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -71,6 +69,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -266,9 +265,14 @@ public class RefactorRetention {
     }
 
     private static KafkaConsumer<String, String> createKafkaClient(RefactorRetentionOptions opts, Map<String, String> configOverrides) {
-        Properties props = opts.options.has(opts.commandConfigOpt) 
-            ? Utils.loadProps(opts.options.valueOf(opts.commandConfigOpt)) 
-            : new Properties();
+        Properties props;
+        try {
+            props = opts.options.has(opts.commandConfigOpt) 
+                ? Utils.loadProps(opts.options.valueOf(opts.commandConfigOpt)) 
+                : new Properties();
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to load command config properties", e);
+        }
         
         props.put("bootstrap.servers", opts.options.valueOf(opts.bootstrapServerOpt));
         configOverrides.forEach(props::put);
@@ -301,19 +305,7 @@ public class RefactorRetention {
         return timestamp;
     }
 
-    private static Set<ConsumerGroupState> consumerGroupStatesFromString(String input) {
-        Set<ConsumerGroupState> parsedStates = Arrays.stream(input.split(","))
-            .map(s -> ConsumerGroupState.parse(s.trim()))
-            .collect(Collectors.toSet());
 
-        if (parsedStates.contains(ConsumerGroupState.UNKNOWN)) {
-            List<ConsumerGroupState> validStates = Arrays.stream(ConsumerGroupState.values())
-                .filter(state -> state != ConsumerGroupState.UNKNOWN)
-                .collect(Collectors.toList());
-            throw new IllegalArgumentException("Invalid state list '" + input + "'. Valid states are: " + validStates);
-        }
-        return parsedStates;
-    }
 
     private static void printError(String msg, Exception e) {
         System.out.println("\nError: " + msg);
@@ -522,11 +514,12 @@ public class RefactorRetention {
             return topicDescription.partitions().size();
         }
 
+        @SuppressWarnings({"deprecation", "removal"})
         List<String> listConsumerGroups() {
             try {
-                var result = adminClient.listConsumerGroups(withTimeoutMs(new ListConsumerGroupsOptions()));
+                var result = adminClient.listConsumerGroups();
                 return result.all().get().stream()
-                    .map(ConsumerGroupListing::groupId)
+                    .map(listing -> listing.groupId())
                     .collect(Collectors.toList());
             } catch (InterruptedException | ExecutionException e) {
                 throw new RuntimeException("Failed to list consumer groups", e);
@@ -596,7 +589,8 @@ public class RefactorRetention {
                 for (Map.Entry<String, ConsumerGroupDescription> entry : consumerGroups.entrySet()) {
                     String groupId = entry.getKey();
                     ConsumerGroupDescription consumerGroup = entry.getValue();
-                    String state = consumerGroup.state().toString();
+                    @SuppressWarnings("deprecation")
+                    String state = consumerGroup.state().name();
                     Map<TopicPartition, OffsetAndMetadata> committedOffsets = getCommittedOffsets(groupId);
 
                     List<PartitionAssignmentState> assignments = new ArrayList<>();
@@ -675,7 +669,7 @@ public class RefactorRetention {
                     .mapToLong(entry -> Long.parseLong(entry.value()))
                     .findFirst()
                     .orElse(0L);
-            } catch (InterruptedException | ExecutionException e) {
+            } catch (InterruptedException | ExecutionException | TimeoutException e) {
                 throw new RuntimeException("Failed to get retention time for topic: " + topic, e);
             }
         }
@@ -711,9 +705,14 @@ public class RefactorRetention {
         }
 
         private Admin createAdminClient(Map<String, String> configOverrides) {
-            Properties props = opts.options.has(opts.commandConfigOpt) 
-                ? Utils.loadProps(opts.options.valueOf(opts.commandConfigOpt)) 
-                : new Properties();
+            Properties props;
+            try {
+                props = opts.options.has(opts.commandConfigOpt) 
+                    ? Utils.loadProps(opts.options.valueOf(opts.commandConfigOpt)) 
+                    : new Properties();
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to load command config properties", e);
+            }
             
             props.put("bootstrap.servers", opts.options.valueOf(opts.bootstrapServerOpt));
             configOverrides.forEach(props::put);
