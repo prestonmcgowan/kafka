@@ -41,6 +41,8 @@ import static java.util.Arrays.stream;
  * <p></p>
  * <pre>
  *    parse.key             : indicates if a record's key is included in a line input and needs to be parsed. (default: false).
+ *    parse.partition       : indicates if a record's partition is included in a line input and needs to be parsed. (default: false).
+ *    parse.timestamp       : indicates if a record's timestamp is included in a line input and needs to be parsed. (default: false).
  *    key.separator         : the string separating a record's key from its value. (default: \t).
  *    parse.headers         : indicates if record headers are included in a line input and need to be parsed. (default: false).
  *    headers.delimiter     : the string separating the list of headers from the record key. (default: \t).
@@ -54,6 +56,8 @@ public class LineMessageReader implements RecordReader {
     private String topic;
     private boolean parseKey;
     private String keySeparator = "\t";
+    private boolean parsePartition;
+    private boolean parseTimestamp;
     private boolean parseHeaders;
     private String headersDelimiter = "\t";
     private String headersSeparator = ",";
@@ -69,6 +73,10 @@ public class LineMessageReader implements RecordReader {
         topic = props.get("topic").toString();
         if (props.containsKey("parse.key"))
             parseKey = props.get("parse.key").toString().trim().equalsIgnoreCase("true");
+        if (props.containsKey("parse.partition"))
+            parsePartition = props.get("parse.partition").toString().trim().equalsIgnoreCase("true");
+        if (props.containsKey("parse.timestamp"))
+            parseTimestamp = props.get("parse.timestamp").toString().trim().equalsIgnoreCase("true");
         if (props.containsKey("key.separator"))
             keySeparator = props.get("key.separator").toString();
         if (props.containsKey("parse.headers"))
@@ -129,13 +137,35 @@ public class LineMessageReader implements RecordReader {
                         String headers = parse(parseHeaders, line, 0, headersDelimiter, "headers delimiter");
                         int headerOffset = headers == null ? 0 : headers.length() + headersDelimiter.length();
 
-                        String key = parse(parseKey, line, headerOffset, keySeparator, "key separator");
+                        String partitionS = parse(parsePartition, line, headerOffset, keySeparator, "key separator");
+                        int partitionOffset = partitionS == null ? 0 : partitionS.length() + keySeparator.length();
+                        Integer partition = partitionS != null ? Integer.parseInt(partitionS) : null;
+
+                        String timestampS = parse(parseTimestamp, line, headerOffset + partitionOffset, keySeparator, "key separator");
+                        int timestampOffset = timestampS == null ? 0 : timestampS.length() + keySeparator.length();
+                        long now = System.currentTimeMillis();
+                        Long timestamp = now;
+                        if (timestampS != null) {
+                            if (timestampS.startsWith("-")) {
+                                String subtract = timestampS.substring(1);
+                                timestamp = now - Long.parseLong(subtract);
+                            } else if (timestampS.startsWith("+")) {
+                                String add = timestampS.substring(1);
+                                timestamp = now + Long.parseLong(add);
+                            } else {
+                                timestamp = Long.parseLong(timestampS);
+                            }
+                        }
+
+                        String key = parse(parseKey, line, headerOffset + partitionOffset + timestampOffset, keySeparator, "key separator");
                         int keyOffset = key == null ? 0 : key.length() + keySeparator.length();
 
-                        String value = line.substring(headerOffset + keyOffset);
+                        String value = line.substring(headerOffset + partitionOffset + timestampOffset + keyOffset);
 
                         ProducerRecord<byte[], byte[]> record = new ProducerRecord<>(
                                 topic,
+                                partition,
+                                timestamp,
                                 key != null && !key.equals(nullMarker) ? key.getBytes(StandardCharsets.UTF_8) : null,
                                 value != null && !value.equals(nullMarker) ? value.getBytes(StandardCharsets.UTF_8) : null
                         );
@@ -209,6 +239,16 @@ public class LineMessageReader implements RecordReader {
     // Visible for testing
     boolean parseKey() {
         return parseKey;
+    }
+
+    // Visible for testing
+    boolean parsePartition() {
+        return parsePartition;
+    }
+
+    // Visible for testing
+    boolean parseTimestamp() {
+        return parseTimestamp;
     }
 
     // Visible for testing
